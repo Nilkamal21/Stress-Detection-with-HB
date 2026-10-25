@@ -1,12 +1,13 @@
 """
 evaluation/evaluate_temporal.py
-Phase 3 (Temporal Stress Inference) — Comprehensive Evaluation & Confusion Matrix on UBFC.
+Phase 3 (Tri-Objective Multi-Task Temporal Stress Inference) — Comprehensive Evaluation & Diagnostics.
 
-Evaluates best_temporal_stress_model.pth on held-out test subjects (subjects 38–42).
-Generates:
-1. Confusion Matrix (Raw counts & Normalized percentage heatmap)
-2. Classification report CSV & JSON
-3. Visual plots saved to results/temporal/
+Evaluates best_temporal_stress_model.pth on held-out test subjects (subjects 38–42):
+1. Stress Confusion Matrix (Raw counts & Normalized percentage heatmap)
+2. Operating Decision Threshold Sweep across tau in [0.35, 0.75]
+3. Heart Rate (HR) Regression Performance (MAE, RMSE, Pearson r)
+4. Blood Volume Pulse (BVP) Waveform Reconstruction (Pearson r correlation)
+5. Visual comparison plots and artifacts saved to results/temporal/
 """
 
 import os
@@ -64,10 +65,46 @@ def plot_temporal_confusion_matrix(cm, class_names, output_path, title="Temporal
     print(f"[Saved Heatmap] {output_path}")
 
 
+def plot_physiological_evaluations(true_hr, pred_hr, true_bvp, pred_bvp):
+    """Generates visual plots for Heart Rate correlation and BVP waveform fidelity."""
+    # 1. Heart Rate Scatter Plot
+    plt.figure(figsize=(6.5, 5))
+    plt.scatter(true_hr, pred_hr, color="teal", alpha=0.5, edgecolors="none", s=25)
+    min_val = min(float(np.min(true_hr)), float(np.min(pred_hr)))
+    max_val = max(float(np.max(true_hr)), float(np.max(pred_hr)))
+    plt.plot([min_val, max_val], [min_val, max_val], 'r--', label="Perfect Agreement (y = x)")
+    plt.title("Heart Rate (HR) Estimation: True vs. Predicted (BPM)", fontsize=11, fontweight="bold")
+    plt.xlabel("Ground Truth Heart Rate (Pulse Oximeter BPM)", fontsize=10)
+    plt.ylabel("Predicted Heart Rate (BiGRU Head BPM)", fontsize=10)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    hr_plot_path = os.path.join(TEMPORAL_RESULTS_DIR, "hr_prediction_scatter.png")
+    plt.savefig(hr_plot_path, dpi=300)
+    plt.close()
+    print(f"[Saved Plot] {hr_plot_path}")
+
+    # 2. BVP Waveform Comparison Plot (Sample Window)
+    if len(true_bvp) > 0 and len(pred_bvp) > 0:
+        plt.figure(figsize=(8, 4))
+        plt.plot(true_bvp[0], label="Ground Truth BVP Waveform (PPG)", color="darkred", linewidth=2.2)
+        plt.plot(pred_bvp[0], label="Reconstructed BVP Waveform (Model Head)", color="dodgerblue", linestyle="--", linewidth=2.0)
+        plt.title("Sample BVP Vascular Pulse Waveform Reconstruction (W=10 frames)", fontsize=11, fontweight="bold")
+        plt.xlabel("Window Frame Index (t)", fontsize=10)
+        plt.ylabel("Normalized Pulse Amplitude", fontsize=10)
+        plt.legend(loc="upper right")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        bvp_plot_path = os.path.join(TEMPORAL_RESULTS_DIR, "bvp_sample_waveform.png")
+        plt.savefig(bvp_plot_path, dpi=300)
+        plt.close()
+        print(f"[Saved Plot] {bvp_plot_path}")
+
+
 def run_temporal_evaluation(data_dir=None, ckpt_path=None, phase2_ckpt=None, threshold=None, window_size=10, stride=4):
     args_thresh = threshold
     print("=" * 65)
-    print("  Phase 3 — Temporal BiGRU Stress Confusion Matrix Evaluation")
+    print("  Phase 3 — Tri-Objective Multi-Task Temporal Stress Evaluation")
     print("=" * 65)
 
     os.makedirs(TEMPORAL_RESULTS_DIR, exist_ok=True)
@@ -75,7 +112,7 @@ def run_temporal_evaluation(data_dir=None, ckpt_path=None, phase2_ckpt=None, thr
 
     # Load feature extractor and extract/load test features
     encoder = load_phase2_feature_extractor(ckpt_path=phase2_ckpt, device=device)
-    test_feats, test_labels, subjs = extract_or_load_features(
+    test_feats, test_labels, test_hr, test_bvp, subjs = extract_or_load_features(
         encoder, data_dir, "test", window_size=window_size, stride=stride, device=device
     )
 
@@ -109,14 +146,30 @@ def run_temporal_evaluation(data_dir=None, ckpt_path=None, phase2_ckpt=None, thr
     else:
         hidden_dim = ckpt.get("hidden_dim", 64)
 
-    print(f"[Model Spec] Input Dim: {input_dim} | Hidden Dim: {hidden_dim} (BiGRU)")
-    model = TemporalStressGRU(input_dim=input_dim, hidden_dim=hidden_dim, num_layers=2, num_classes=2, bidirectional=True).to(device)
-    model.load_state_dict(state_dict)
+    print(f"[Model Spec] Input Dim: {input_dim} | Hidden Dim: {hidden_dim} (BiGRU Multi-Task)")
+    model = TemporalStressGRU(
+        input_dim=input_dim,
+        hidden_dim=hidden_dim,
+        num_layers=2,
+        num_classes=2,
+        window_size=window_size,
+        bidirectional=True
+    ).to(device)
+
+    model.load_state_dict(state_dict, strict=False)
     model.eval()
 
     # 1. Evaluate Test Predictions
     with torch.no_grad():
-        logits, weights = model(test_feats.to(device))
+        out = model(test_feats.to(device))
+        if len(out) == 4:
+            logits, pred_hr, pred_bvp, weights = out
+            has_mt = True
+        else:
+            logits, weights = out
+            pred_hr, pred_bvp = None, None
+            has_mt = False
+
         probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
         targets = test_labels.numpy()
 
@@ -141,7 +194,6 @@ def run_temporal_evaluation(data_dir=None, ckpt_path=None, phase2_ckpt=None, thr
         prec_th = tp / max(tp + fp, 1) * 100.0
         f1_th = 2 * (prec_th * sens_th) / max(prec_th + sens_th, 1e-6)
 
-        # Balance criterion: minimize difference between specificity and sensitivity
         diff = abs(spec_th - sens_th)
         if diff < min_diff:
             min_diff = diff
@@ -198,9 +250,30 @@ def run_temporal_evaluation(data_dir=None, ckpt_path=None, phase2_ckpt=None, thr
     print(f"  - F1-Score   : {f1 * 100:.2f}%")
     print(f"  - ROC-AUC    : {auc:.2f}%")
 
+    # 3. Physiological Multi-Task Performance Evaluation
+    if has_mt and pred_hr is not None and pred_bvp is not None:
+        np_pred_hr = pred_hr.squeeze(-1).cpu().numpy()
+        np_true_hr = test_hr.numpy()
+        np_pred_bvp = pred_bvp.cpu().numpy()
+        np_true_bvp = test_bvp.numpy()
+
+        hr_mae = float(np.mean(np.abs(np_pred_hr - np_true_hr)))
+        hr_rmse = float(np.sqrt(np.mean((np_pred_hr - np_true_hr) ** 2)))
+        try:
+            hr_corr = float(np.corrcoef(np_true_hr, np_pred_hr)[0, 1])
+        except Exception:
+            hr_corr = 0.0
+
+        print(f"\nPhysiological Telemetry Performance on Held-Out Subjects:")
+        print(f"  - Heart Rate MAE : {hr_mae:.2f} BPM")
+        print(f"  - Heart Rate RMSE: {hr_rmse:.2f} BPM")
+        print(f"  - Heart Rate r   : {hr_corr:.4f}")
+
+        plot_physiological_evaluations(np_true_hr, np_pred_hr, np_true_bvp, np_pred_bvp)
+
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate Temporal Stress BiGRU")
+    parser = argparse.ArgumentParser(description="Evaluate Tri-Objective Multi-Task Temporal Stress BiGRU")
     parser.add_argument("--data_dir", type=str, default="/kaggle/working/ubfc_faces")
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--phase2_ckpt", type=str, default=None)

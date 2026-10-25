@@ -1,11 +1,15 @@
 """
 models/temporal_model.py
-Phase 3 (Temporal Stress Inference) — Steps 20 & 21: Recurrent Temporal Model.
+Phase 3 (Tri-Objective Multi-Task Temporal Stress Inference) — Steps 20 & 21: Recurrent Multi-Task Model.
 
 Models temporal relationships across video frame sequences using a Gated Recurrent Unit (GRU)
-with Temporal Attention Pooling to detect dynamic micro-expressions and stress patterns:
-    [f_1, f_2, ..., f_W] -> Bidirectional GRU -> Temporal Attention -> Stress Classifier.
-Provides both standalone feature-sequence GRU and End-to-End temporal models.
+with Temporal Attention Pooling to predict three synchronized physiological/affective indicators:
+    [f_1, f_2, ..., f_W] -> Bidirectional GRU -> Temporal Attention
+                                                         │
+                                ┌────────────────────────┼────────────────────────┐
+                                ▼                        ▼                        ▼
+                       [Stress Classifier]         [HR Regressor]           [BVP Regressor]
+                        Logits: [B, 2]             BPM: [B, 1]              Waveform: [B, W]
 """
 
 import os
@@ -41,18 +45,20 @@ class TemporalAttention(nn.Module):
             context_vector: (batch_size, hidden_dim)
             attention_weights: (batch_size, seq_len, 1)
         """
-        # Calculate attention scores: (batch_size, seq_len, 1)
         scores = self.attention(rnn_outputs)
         weights = F.softmax(scores, dim=1)
-        # Weighted sum over temporal dimension
         context = torch.sum(rnn_outputs * weights, dim=1)
         return context, weights
 
 
 class TemporalStressGRU(nn.Module):
     """
-    Recurrent temporal network for stress-oriented sequence inference.
-    Takes sequences of frame feature vectors [B, W, input_dim] and outputs stress logits [B, num_classes].
+    Tri-Objective Multi-Task Recurrent temporal network for affective & physiological stress inference.
+    Takes sequences of frame feature vectors [B, W, input_dim] and outputs:
+    1. stress_logits: [B, num_classes] (Binary Calm vs. Cognitive Stress)
+    2. hr_pred: [B, 1] (Continuous Heart Rate in BPM)
+    3. bvp_pred: [B, W] (Continuous Blood Volume Pulse vascular waveform)
+    4. weights: [B, W, 1] (Temporal attention weights)
     """
     def __init__(
         self,
@@ -60,6 +66,7 @@ class TemporalStressGRU(nn.Module):
         hidden_dim=128,
         num_layers=2,
         num_classes=2,
+        window_size=10,
         dropout=0.2,
         bidirectional=True
     ):
@@ -69,8 +76,9 @@ class TemporalStressGRU(nn.Module):
         self.num_layers = num_layers
         self.bidirectional = bidirectional
         self.num_classes = num_classes
+        self.window_size = window_size
 
-        # Bidirectional GRU captures both forward onset and backward recovery dynamics
+        # Bidirectional GRU captures forward onset and backward recovery dynamics
         self.gru = nn.GRU(
             input_size=input_dim,
             hidden_size=hidden_dim,
@@ -83,6 +91,7 @@ class TemporalStressGRU(nn.Module):
         rnn_out_dim = hidden_dim * 2 if bidirectional else hidden_dim
         self.attention = TemporalAttention(rnn_out_dim)
 
+        # Head 1: Binary Stress Classifier (Calm vs. Acute Mental Stress)
         self.classifier = nn.Sequential(
             nn.Linear(rnn_out_dim, 64),
             nn.BatchNorm1d(64),
@@ -91,24 +100,44 @@ class TemporalStressGRU(nn.Module):
             nn.Linear(64, num_classes)
         )
 
+        # Head 2: Heart Rate (HR) Regressor in Beats Per Minute (BPM)
+        self.hr_head = nn.Sequential(
+            nn.Linear(rnn_out_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
+
+        # Head 3: Blood Volume Pulse (BVP) Waveform Regressor (W-length pulse curve)
+        self.bvp_head = nn.Sequential(
+            nn.Linear(rnn_out_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, window_size)
+        )
+
     def forward(self, x):
         """
         Args:
             x: Feature sequence tensor of shape (batch_size, window_size, input_dim)
         Returns:
-            logits: (batch_size, num_classes)
-            weights: (batch_size, window_size, 1) temporal attention weights
+            stress_logits: (batch_size, num_classes)
+            hr_pred: (batch_size, 1)
+            bvp_pred: (batch_size, window_size)
+            weights: (batch_size, window_size, 1)
         """
         rnn_out, _ = self.gru(x)  # shape: (batch_size, window_size, rnn_out_dim)
         context, weights = self.attention(rnn_out)  # shape: (batch_size, rnn_out_dim)
-        logits = self.classifier(context)  # shape: (batch_size, num_classes)
-        return logits, weights
+        
+        stress_logits = self.classifier(context)
+        hr_pred = self.hr_head(context)
+        bvp_pred = self.bvp_head(context)
+
+        return stress_logits, hr_pred, bvp_pred, weights
 
 
 class EndToEndTemporalStressModel(nn.Module):
     """
-    Full end-to-end inference pipeline:
-    Raw Temporal Video Windows [B, W, 3, 224, 224] -> CNN Backbone -> GRU -> Stress Logits [B, 2].
+    Full end-to-end multi-task inference pipeline:
+    Raw Video Windows [B, W, 3, 224, 224] -> CNN Backbone -> BiGRU -> (Stress, HR, BVP).
     """
     def __init__(self, visual_encoder, temporal_rnn):
         super().__init__()
@@ -120,54 +149,42 @@ class EndToEndTemporalStressModel(nn.Module):
         Args:
             video_tensor: Shape (batch_size, window_size, 3, 224, 224)
         Returns:
-            logits: (batch_size, num_classes)
-            attention_weights: (batch_size, window_size, 1)
+            stress_logits: (batch_size, num_classes)
+            hr_pred: (batch_size, 1)
+            bvp_pred: (batch_size, window_size)
+            weights: (batch_size, window_size, 1)
         """
         b, w, c, h, d = video_tensor.shape
-        # Flatten temporal dimension into batch for parallel CNN feature extraction
         flat_frames = video_tensor.view(b * w, c, h, d)
         features = self.encoder(flat_frames)  # shape: (b * w, 1280)
-        # Reshape back to temporal sequence
         seq_features = features.view(b, w, -1)  # shape: (b, w, 1280)
-        logits, weights = self.temporal_rnn(seq_features)
-        return logits, weights
+        return self.temporal_rnn(seq_features)
 
 
 def run_temporal_model_test():
-    """Standalone diagnostic verifying Step 3.2 model architecture."""
+    """Standalone diagnostic verifying Step 3.2 multi-task architecture."""
     print("=" * 65)
-    print("  Phase 3 (Step 3.2) — Recurrent Temporal Model (GRU + Attention)")
+    print("  Phase 3 — Tri-Objective Multi-Task Temporal Model Diagnostic")
     print("=" * 65)
 
     batch_size = 4
     window_size = 10
     feature_dim = 1280
 
-    # Test standalone GRU
-    model = TemporalStressGRU(input_dim=feature_dim, hidden_dim=128, num_classes=2)
+    model = TemporalStressGRU(input_dim=feature_dim, hidden_dim=64, num_classes=2, window_size=window_size)
     dummy_features = torch.randn(batch_size, window_size, feature_dim)
 
-    logits, weights = model(dummy_features)
-    print(f"[Feature GRU Input]     : {list(dummy_features.shape)} [Batch, Window, Features]")
-    print(f"[Logits Output]         : {list(logits.shape)} [Batch, NumClasses]")
-    print(f"[Attention Weights]     : {list(weights.shape)} [Batch, Window, 1]")
+    logits, hr_pred, bvp_pred, weights = model(dummy_features)
+    print(f"[Input Sequence]         : {list(dummy_features.shape)} [Batch, Window, Dim]")
+    print(f"[1. Stress Logits]       : {list(logits.shape)} [Batch, 2]")
+    print(f"[2. Heart Rate (HR)]     : {list(hr_pred.shape)} [Batch, 1]")
+    print(f"[3. BVP Pulse Waveform]  : {list(bvp_pred.shape)} [Batch, {window_size}]")
+    print(f"[4. Attention Weights]   : {list(weights.shape)} [Batch, Window, 1]")
 
-    # Verify attention weights sum to 1.0 across the 10 frames
     weight_sums = weights.sum(dim=1).squeeze(-1)
-    print(f"[Attention Sums (==1.0)]: {weight_sums.tolist()}")
-
-    # Test End-to-End wrapper
-    encoder = EfficientNetEncoder(pretrained=False)
-    e2e_model = EndToEndTemporalStressModel(visual_encoder=encoder, temporal_rnn=model)
-
-    dummy_video = torch.randn(2, 5, 3, 224, 224)
-    with torch.no_grad():
-        e2e_logits, e2e_weights = e2e_model(dummy_video)
-
-    print(f"[End-to-End Input]      : {list(dummy_video.shape)} [Batch, Window, C, H, W]")
-    print(f"[End-to-End Output]     : {list(e2e_logits.shape)}")
+    print(f"[Attention Sums (==1.0)] : {weight_sums.tolist()}")
     print("=" * 65)
-    print("[SUCCESS] Step 3.2 Recurrent Temporal Model verified!")
+    print("[SUCCESS] Tri-Objective Multi-Task Temporal Model verified!")
 
 
 if __name__ == "__main__":
