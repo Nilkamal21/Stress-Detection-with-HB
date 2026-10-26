@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 from models.efficientnet_encoder import EfficientNetEncoder
 from models.emotion_classifier import EmotionClassifier, EndToEndEmotionModel
-from models.temporal_model import TemporalStressGRU
+from models.temporal_model import TemporalStressGRU, TwoStreamTemporalStressGRU
 from datasets.rafdb_dataset import RAFDB_IDX_TO_NAME
 
 REALTIME_RESULTS_DIR = os.path.join(config.RESULTS_DIR, "realtime")
@@ -80,37 +80,75 @@ class RealtimeTemporalStressPipeline:
         self.phase2_model = self.phase2_model.to(self.device).eval()
 
         # 2. Recurrent Temporal Model (Phase 3 Multi-Task GRU)
-        phase3_ckpt = os.path.join(config.CHECKPOINTS_DIR, "best_temporal_stress_model.pth")
+        candidate_p3 = [
+            os.path.join(config.CHECKPOINTS_DIR, "best_temporal_stress_model_twostream.pth"),
+            os.path.join(config.CHECKPOINTS_DIR, "best_temporal_stress_model.pth"),
+        ]
+        phase3_ckpt = None
+        for cp in candidate_p3:
+            if os.path.exists(cp):
+                phase3_ckpt = cp
+                break
+
         hidden_dim = 64
         t_state_dict = None
+        self.is_two_stream = False
+        self.micro_window_size = self.window_size
+        self.macro_window_size = 30
+        self.macro_span_frames = 60
 
-        if os.path.exists(phase3_ckpt):
+        if phase3_ckpt is not None:
             print(f"[Phase 3 Model] Loading: {phase3_ckpt}")
             ckpt = torch.load(phase3_ckpt, map_location=self.device, weights_only=False)
             t_state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
-            if "gru.weight_ih_l0" in t_state_dict:
-                hidden_dim = t_state_dict["gru.weight_ih_l0"].shape[0] // 3
+            self.is_two_stream = bool(ckpt.get("two_stream", False) or "gru_micro.weight_ih_l0" in t_state_dict)
+
+            if self.is_two_stream:
+                self.micro_window_size = ckpt.get("micro_window_size", self.window_size)
+                self.macro_window_size = ckpt.get("macro_window_size", 30)
+                self.macro_span_frames = ckpt.get("macro_span_frames", 60)
+                if "gru_micro.weight_ih_l0" in t_state_dict:
+                    hidden_dim = t_state_dict["gru_micro.weight_ih_l0"].shape[0] // 3
+                else:
+                    hidden_dim = ckpt.get("hidden_dim", 64)
+                print(f"[OK] Loaded Multi-Scale Two-Stream GRU (Micro: {self.micro_window_size}f, Macro: {self.macro_window_size}f/{self.macro_span_frames}f, hidden_dim={hidden_dim})")
             else:
-                hidden_dim = ckpt.get("hidden_dim", 64)
-            print(f"[OK] Detected hidden_dim={hidden_dim} from Phase 3 checkpoint.")
+                if "gru.weight_ih_l0" in t_state_dict:
+                    hidden_dim = t_state_dict["gru.weight_ih_l0"].shape[0] // 3
+                else:
+                    hidden_dim = ckpt.get("hidden_dim", 64)
+                print(f"[OK] Loaded Single-Stream GRU (Window: {self.window_size}f, hidden_dim={hidden_dim})")
         else:
             print("[WARN] Phase 3 temporal checkpoint not found! Using initialized weights.")
 
-        self.temporal_gru = TemporalStressGRU(
-            input_dim=self.encoder.feature_dim,
-            hidden_dim=hidden_dim,
-            num_layers=2,
-            num_classes=2,
-            window_size=self.window_size,
-            bidirectional=True
-        )
+        if self.is_two_stream:
+            self.temporal_gru = TwoStreamTemporalStressGRU(
+                input_dim=self.encoder.feature_dim,
+                hidden_dim=hidden_dim,
+                num_layers=2,
+                num_classes=2,
+                micro_window_size=self.micro_window_size,
+                macro_window_size=self.macro_window_size,
+                bidirectional=True
+            )
+        else:
+            self.temporal_gru = TemporalStressGRU(
+                input_dim=self.encoder.feature_dim,
+                hidden_dim=hidden_dim,
+                num_layers=2,
+                num_classes=2,
+                window_size=self.window_size,
+                bidirectional=True
+            )
+
         if t_state_dict is not None:
             self.temporal_gru.load_state_dict(t_state_dict, strict=False)
 
         self.temporal_gru = self.temporal_gru.to(self.device).eval()
 
         # 3. Rolling Temporal Buffers & Telemetry History
-        self.feature_buffer = deque(maxlen=self.window_size)
+        self.feature_buffer = deque(maxlen=self.micro_window_size)
+        self.macro_feature_buffer = deque(maxlen=self.macro_span_frames)
         self.smooth_buffer = deque(maxlen=self.smooth_k)
         self.hr_smooth_buffer = deque(maxlen=5)
         self.bvp_history = deque(maxlen=80)
@@ -192,17 +230,27 @@ class RealtimeTemporalStressPipeline:
             emotion_name = RAFDB_IDX_TO_NAME.get(emotion_idx, "Neutral")
             emotion_conf = float(emotion_probs[emotion_idx])
 
-        # 3. Update Rolling Feature Buffer
-        self.feature_buffer.append(feat.squeeze(0).cpu())
-        features_list = list(self.feature_buffer)
-        while len(features_list) < self.window_size:
-            features_list.append(features_list[-1])
+        # 3. Update Rolling Feature Buffers
+        feat_cpu = feat.squeeze(0).cpu()
+        self.feature_buffer.append(feat_cpu)
+        self.macro_feature_buffer.append(feat_cpu)
 
-        seq_tensor = torch.stack(features_list, dim=0).unsqueeze(0).to(self.device)  # [1, 10, 1280]
+        # Build micro sequence tensor [1, micro_w, 1280]
+        micro_list = list(self.feature_buffer)
+        while len(micro_list) < self.micro_window_size:
+            micro_list.append(micro_list[-1])
+        micro_tensor = torch.stack(micro_list, dim=0).unsqueeze(0).to(self.device)
 
-        # 4. Multi-Task Recurrent Temporal Inference
+        # 4. Multi-Task Temporal Inference
         with torch.no_grad():
-            out = self.temporal_gru(seq_tensor)
+            if self.is_two_stream:
+                macro_list = list(self.macro_feature_buffer)
+                indices = np.linspace(0, len(macro_list) - 1, self.macro_window_size).astype(int)
+                macro_sampled = [macro_list[i] for i in indices]
+                macro_tensor = torch.stack(macro_sampled, dim=0).unsqueeze(0).to(self.device)
+                out = self.temporal_gru(micro_tensor, macro_tensor)
+            else:
+                out = self.temporal_gru(micro_tensor)
             if len(out) == 4:
                 stress_logits, pred_hr, pred_bvp, attn_weights = out
                 raw_stress = float(torch.softmax(stress_logits, dim=1)[0, 1].cpu().item())

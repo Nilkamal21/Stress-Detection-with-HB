@@ -12,9 +12,10 @@ data/
 
 # Keep models_checkpoints tracked
 models_checkpoints/best_rafdb_affective_model.pth
+models_checkpoints/self_supervised_backbone.pth
 !models_checkpoints/*.part*
 !models_checkpoints/*.tflite
-!models_checkpoints/best_temporal_stress_model.pth
+!models_checkpoints/best_temporal_stress_model*.pth
 
 # Environments
 .vscode/

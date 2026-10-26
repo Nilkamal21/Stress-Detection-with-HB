@@ -134,6 +134,109 @@ class TemporalStressGRU(nn.Module):
         return stress_logits, hr_pred, bvp_pred, weights
 
 
+class TwoStreamTemporalStressGRU(nn.Module):
+    """
+    Two-Stream Multi-Scale Temporal Network (Change 2):
+    Stream A (Micro / Fast): W_micro frames (default 10 frames = ~1.7s) to detect rapid micro-expressions.
+    Stream B (Macro / Slow): W_macro frames (default 30 frames spanning 10s) to detect sustained baseline cognitive stress.
+    Fused via Concatenation + Attention Pooling -> Tri-Objective Heads (Stress, HR, BVP).
+    """
+    def __init__(
+        self,
+        input_dim=1280,
+        hidden_dim=64,
+        num_layers=2,
+        num_classes=2,
+        micro_window_size=10,
+        macro_window_size=30,
+        dropout=0.3,
+        bidirectional=True
+    ):
+        super().__init__()
+        self.micro_window_size = micro_window_size
+        self.macro_window_size = macro_window_size
+        self.hidden_dim = hidden_dim
+        self.bidirectional = bidirectional
+        rnn_out_dim = hidden_dim * 2 if bidirectional else hidden_dim
+
+        # Stream A: Micro (Fast)
+        self.gru_micro = nn.GRU(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=bidirectional,
+            dropout=dropout if num_layers > 1 else 0.0
+        )
+        self.attn_micro = TemporalAttention(rnn_out_dim)
+
+        # Stream B: Macro (Slow)
+        self.gru_macro = nn.GRU(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=bidirectional,
+            dropout=dropout if num_layers > 1 else 0.0
+        )
+        self.attn_macro = TemporalAttention(rnn_out_dim)
+
+        # Fused Representation
+        fused_dim = rnn_out_dim * 2
+
+        # Head 1: Binary Stress Classifier
+        self.classifier = nn.Sequential(
+            nn.Linear(fused_dim, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, num_classes)
+        )
+
+        # Head 2: Heart Rate (BPM) Regressor
+        self.hr_head = nn.Sequential(
+            nn.Linear(fused_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
+
+        # Head 3: BVP Waveform Regressor
+        self.bvp_head = nn.Sequential(
+            nn.Linear(fused_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, micro_window_size)
+        )
+
+    def forward(self, micro_x, macro_x=None):
+        """
+        Args:
+            micro_x: [B, W_micro, input_dim]
+            macro_x: [B, W_macro, input_dim] (optional fallback to micro_x)
+        Returns:
+            stress_logits: [B, num_classes]
+            hr_pred: [B, 1]
+            bvp_pred: [B, micro_window_size]
+            weights: (weights_micro, weights_macro)
+        """
+        if macro_x is None:
+            # Fallback interpolation if only single stream provided
+            macro_x = micro_x
+
+        rnn_micro, _ = self.gru_micro(micro_x)
+        ctx_micro, w_micro = self.attn_micro(rnn_micro)
+
+        rnn_macro, _ = self.gru_macro(macro_x)
+        ctx_macro, w_macro = self.attn_macro(rnn_macro)
+
+        ctx_fused = torch.cat([ctx_micro, ctx_macro], dim=-1)
+
+        stress_logits = self.classifier(ctx_fused)
+        hr_pred = self.hr_head(ctx_fused)
+        bvp_pred = self.bvp_head(ctx_fused)
+
+        return stress_logits, hr_pred, bvp_pred, (w_micro, w_macro)
+
+
 class EndToEndTemporalStressModel(nn.Module):
     """
     Full end-to-end multi-task inference pipeline:

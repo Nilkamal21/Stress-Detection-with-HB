@@ -32,9 +32,10 @@ from models.efficientnet_encoder import EfficientNetEncoder
 from models.emotion_classifier import EmotionClassifier, EndToEndEmotionModel
 from datasets.temporal_dataset import (
     UBFCTemporalDataset,
+    UBFCTwoStreamDataset,
     SUBJECT_SPLITS,
 )
-from models.temporal_model import TemporalStressGRU
+from models.temporal_model import TemporalStressGRU, TwoStreamTemporalStressGRU
 
 TEMPORAL_RESULTS_DIR = os.path.join(config.RESULTS_DIR, "temporal")
 FEATURES_CACHE_DIR = os.path.join(config.PROJECT_ROOT, "features")
@@ -198,6 +199,103 @@ def extract_or_load_features(
     return features, labels, hr_targets, bvp_targets, all_subj_ids
 
 
+def extract_or_load_twostream_features(
+    encoder,
+    data_dir,
+    split,
+    micro_window_size=10,
+    macro_window_size=30,
+    macro_span_frames=60,
+    stride=2,
+    baseline_seconds=30.0,
+    fps=6.0,
+    device="cuda"
+):
+    """
+    Extracts multi-scale two-stream features (Micro: 10 frames, Macro: 30 frames spanning 60 frames)
+    using the Phase 2 encoder and caches them to disk.
+    """
+    os.makedirs(FEATURES_CACHE_DIR, exist_ok=True)
+    cache_path = os.path.join(
+        FEATURES_CACHE_DIR,
+        f"ubfc_features_twostream_{split}_w{micro_window_size}_mw{macro_window_size}_ms{macro_span_frames}_s{stride}.pt"
+    )
+
+    if os.path.exists(cache_path):
+        print(f"[Cache Hit] Loading two-stream features for {split.upper()} from {cache_path}")
+        data = torch.load(cache_path, map_location="cpu", weights_only=False)
+        return (
+            data["micro_features"],
+            data["macro_features"],
+            data["labels"],
+            data["hr_targets"],
+            data["bvp_targets"],
+            data.get("subject_ids", [])
+        )
+
+    print(f"[Extracting] Pre-extracting two-stream features for {split.upper()} on {device}...")
+    dataset = UBFCTwoStreamDataset(
+        data_dir=data_dir,
+        split=split,
+        micro_window_size=micro_window_size,
+        macro_window_size=macro_window_size,
+        macro_span_frames=macro_span_frames,
+        stride=stride,
+        baseline_seconds=baseline_seconds,
+        fps=fps
+    )
+
+    if len(dataset) == 0:
+        raise RuntimeError(f"No two-stream temporal windows found for split '{split}' in {data_dir}!")
+
+    loader = DataLoader(dataset, batch_size=4, shuffle=False, num_workers=0)
+
+    all_micro_feats = []
+    all_macro_feats = []
+    all_labels = []
+    all_hr = []
+    all_bvp = []
+    all_subjs = []
+
+    encoder.eval()
+    with torch.no_grad():
+        for batch_micro, batch_macro, batch_lbls, batch_hrs, batch_bvps, batch_subjs in loader:
+            b, w_mic, c, h, w_dim = batch_micro.shape
+            flat_micro = batch_micro.view(b * w_mic, c, h, w_dim).to(device)
+            feats_micro = encoder(flat_micro)
+            seq_micro = feats_micro.view(b, w_mic, -1).cpu()
+
+            b, w_mac, c, h, w_dim = batch_macro.shape
+            flat_macro = batch_macro.view(b * w_mac, c, h, w_dim).to(device)
+            feats_macro = encoder(flat_macro)
+            seq_macro = feats_macro.view(b, w_mac, -1).cpu()
+
+            all_micro_feats.append(seq_micro)
+            all_macro_feats.append(seq_macro)
+            all_labels.append(batch_lbls)
+            all_hr.append(batch_hrs)
+            all_bvp.append(batch_bvps)
+            all_subjs.extend(batch_subjs)
+
+    micro_features = torch.cat(all_micro_feats, dim=0)
+    macro_features = torch.cat(all_macro_feats, dim=0)
+    labels = torch.cat(all_labels, dim=0)
+    hr_targets = torch.cat(all_hr, dim=0)
+    bvp_targets = torch.cat(all_bvp, dim=0)
+
+    torch.save({
+        "micro_features": micro_features,
+        "macro_features": macro_features,
+        "labels": labels,
+        "hr_targets": hr_targets,
+        "bvp_targets": bvp_targets,
+        "subject_ids": all_subjs
+    }, cache_path)
+    print(f"[Cached] Saved {micro_features.shape[0]} two-stream feature windows to {cache_path}")
+    return micro_features, macro_features, labels, hr_targets, bvp_targets, all_subjs
+
+
+
 class TemporalMovingAverageSmoother:
     """
     Step 22: Temporal Moving Average Smoothing Filter.
@@ -233,20 +331,30 @@ def train_temporal_model(
     lr=1e-3,
     hidden_dim=64,
     window_size=10,
+    macro_window_size=30,
+    macro_span_frames=60,
+    two_stream=False,
     stride=2,
     baseline_seconds=30.0,
     fps=6.0,
     dropout=0.3,
     weight_decay=0.01,
     lambda_hr=0.05,
-    lambda_bvp=0.10
+    lambda_bvp=0.10,
+    ckpt_name=None
 ):
+    arch_name = "Multi-Scale Two-Stream BiGRU (Change 2)" if two_stream else "Single-Stream BiGRU (Change 1)"
     print("=" * 65)
-    print("  Phase 3 — Tri-Objective Multi-Task Temporal Stress Modeling")
+    print(f"  Phase 3 — Tri-Objective Multi-Task Temporal Stress Modeling")
+    print(f"  Architecture       : {arch_name}")
     print(f"  Target Epochs      : {epochs}")
     print(f"  Batch Size         : {batch_size}")
     print(f"  Learning Rate      : {lr}")
-    print(f"  Window Size        : {window_size} frames")
+    if two_stream:
+        print(f"  Micro Window Size  : {window_size} frames (~{window_size/fps:.1f}s)")
+        print(f"  Macro Window Size  : {macro_window_size} frames sampled across {macro_span_frames} frames (~{macro_span_frames/fps:.1f}s)")
+    else:
+        print(f"  Window Size        : {window_size} frames")
     print(f"  Training Stride    : {stride}")
     print(f"  GRU Hidden Dim     : {hidden_dim} (BiGRU + Attention)")
     print(f"  Multi-Task Weights : Lambda HR: {lambda_hr} | Lambda BVP: {lambda_bvp}")
@@ -263,40 +371,68 @@ def train_temporal_model(
     encoder = load_phase2_feature_extractor(ckpt_path=phase2_ckpt, device=device)
 
     # 2. Extract / Load Multi-Task Features
-    train_x, train_y, train_hr, train_bvp, _ = extract_or_load_features(
-        encoder, data_dir, "train", window_size=window_size, stride=stride,
-        baseline_seconds=baseline_seconds, fps=fps, device=device
-    )
-    val_x, val_y, val_hr, val_bvp, _ = extract_or_load_features(
-        encoder, data_dir, "val", window_size=window_size, stride=stride * 2,
-        baseline_seconds=baseline_seconds, fps=fps, device=device
-    )
-    test_x, test_y, test_hr, test_bvp, _ = extract_or_load_features(
-        encoder, data_dir, "test", window_size=window_size, stride=stride * 2,
-        baseline_seconds=baseline_seconds, fps=fps, device=device
-    )
+    if two_stream:
+        train_mic, train_mac, train_y, train_hr, train_bvp, _ = extract_or_load_twostream_features(
+            encoder, data_dir, "train", micro_window_size=window_size, macro_window_size=macro_window_size,
+            macro_span_frames=macro_span_frames, stride=stride, baseline_seconds=baseline_seconds, fps=fps, device=device
+        )
+        val_mic, val_mac, val_y, val_hr, val_bvp, _ = extract_or_load_twostream_features(
+            encoder, data_dir, "val", micro_window_size=window_size, macro_window_size=macro_window_size,
+            macro_span_frames=macro_span_frames, stride=stride * 2, baseline_seconds=baseline_seconds, fps=fps, device=device
+        )
+        test_mic, test_mac, test_y, test_hr, test_bvp, _ = extract_or_load_twostream_features(
+            encoder, data_dir, "test", micro_window_size=window_size, macro_window_size=macro_window_size,
+            macro_span_frames=macro_span_frames, stride=stride * 2, baseline_seconds=baseline_seconds, fps=fps, device=device
+        )
+        train_loader = DataLoader(TensorDataset(train_mic, train_mac, train_y, train_hr, train_bvp), batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(TensorDataset(val_mic, val_mac, val_y, val_hr, val_bvp), batch_size=batch_size, shuffle=False)
+        test_loader = DataLoader(TensorDataset(test_mic, test_mac, test_y, test_hr, test_bvp), batch_size=batch_size, shuffle=False)
 
-    print(f"[Dataset] Train Windows: {len(train_x)} | Val Windows: {len(val_x)} | Test Windows: {len(test_x)}")
+        model = TwoStreamTemporalStressGRU(
+            input_dim=train_mic.shape[-1],
+            hidden_dim=hidden_dim,
+            num_layers=2,
+            num_classes=2,
+            micro_window_size=window_size,
+            macro_window_size=macro_window_size,
+            dropout=dropout,
+            bidirectional=True
+        ).to(device)
+        total_samples = len(train_y)
+    else:
+        train_x, train_y, train_hr, train_bvp, _ = extract_or_load_features(
+            encoder, data_dir, "train", window_size=window_size, stride=stride,
+            baseline_seconds=baseline_seconds, fps=fps, device=device
+        )
+        val_x, val_y, val_hr, val_bvp, _ = extract_or_load_features(
+            encoder, data_dir, "val", window_size=window_size, stride=stride * 2,
+            baseline_seconds=baseline_seconds, fps=fps, device=device
+        )
+        test_x, test_y, test_hr, test_bvp, _ = extract_or_load_features(
+            encoder, data_dir, "test", window_size=window_size, stride=stride * 2,
+            baseline_seconds=baseline_seconds, fps=fps, device=device
+        )
+        train_loader = DataLoader(TensorDataset(train_x, train_y, train_hr, train_bvp), batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(TensorDataset(val_x, val_y, val_hr, val_bvp), batch_size=batch_size, shuffle=False)
+        test_loader = DataLoader(TensorDataset(test_x, test_y, test_hr, test_bvp), batch_size=batch_size, shuffle=False)
 
-    train_loader = DataLoader(TensorDataset(train_x, train_y, train_hr, train_bvp), batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(TensorDataset(val_x, val_y, val_hr, val_bvp), batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(TensorDataset(test_x, test_y, test_hr, test_bvp), batch_size=batch_size, shuffle=False)
+        model = TemporalStressGRU(
+            input_dim=train_x.shape[-1],
+            hidden_dim=hidden_dim,
+            num_layers=2,
+            num_classes=2,
+            window_size=window_size,
+            dropout=dropout,
+            bidirectional=True
+        ).to(device)
+        total_samples = len(train_y)
 
-    # 3. Model & Multi-Task Optimization
-    model = TemporalStressGRU(
-        input_dim=train_x.shape[-1],
-        hidden_dim=hidden_dim,
-        num_layers=2,
-        num_classes=2,
-        window_size=window_size,
-        dropout=dropout,
-        bidirectional=True
-    ).to(device)
+    print(f"[Dataset] Train Windows: {len(train_loader.dataset)} | Val Windows: {len(val_loader.dataset)} | Test Windows: {len(test_loader.dataset)}")
 
     num_calm = (train_y == 0).sum().item()
     num_stress = (train_y == 1).sum().item()
-    w_calm = float(len(train_y)) / (2.0 * max(num_calm, 1))
-    w_stress = float(len(train_y)) / (2.0 * max(num_stress, 1))
+    w_calm = float(total_samples) / (2.0 * max(num_calm, 1))
+    w_stress = float(total_samples) / (2.0 * max(num_stress, 1))
     weight_tensor = torch.tensor([w_calm, w_stress], dtype=torch.float).to(device)
     print(f"[Class Weights] Calm (0): {w_calm:.2f} | Stress (1): {w_stress:.2f}")
 
@@ -308,10 +444,11 @@ def train_temporal_model(
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
 
     best_val_score = 0.0
-    best_ckpt_path = os.path.join(config.CHECKPOINTS_DIR, "best_temporal_stress_model.pth")
+    default_ckpt_name = "best_temporal_stress_model_twostream.pth" if two_stream else "best_temporal_stress_model.pth"
+    best_ckpt_path = os.path.join(config.CHECKPOINTS_DIR, ckpt_name or default_ckpt_name)
     history = []
 
-    print("\n--- Training Tri-Objective Multi-Task Temporal GRU ---")
+    print(f"\n--- Training Multi-Task Temporal GRU ({arch_name}) ---")
     for epoch in range(1, epochs + 1):
         model.train()
         running_loss = 0.0
@@ -320,14 +457,19 @@ def train_temporal_model(
         running_bvp_loss = 0.0
         train_preds, train_targets = [], []
 
-        for bx, by_stress, by_hr, by_bvp in train_loader:
-            bx = bx.to(device)
-            by_stress = by_stress.to(device)
-            by_hr = by_hr.to(device)
-            by_bvp = by_bvp.to(device)
-
-            optimizer.zero_grad()
-            logits, pred_hr, pred_bvp, _ = model(bx)
+        for batch in train_loader:
+            if two_stream:
+                bx_mic, bx_mac, by_stress, by_hr, by_bvp = batch
+                bx_mic, bx_mac = bx_mic.to(device), bx_mac.to(device)
+                by_stress, by_hr, by_bvp = by_stress.to(device), by_hr.to(device), by_bvp.to(device)
+                optimizer.zero_grad()
+                logits, pred_hr, pred_bvp, _ = model(bx_mic, bx_mac)
+            else:
+                bx, by_stress, by_hr, by_bvp = batch
+                bx = bx.to(device)
+                by_stress, by_hr, by_bvp = by_stress.to(device), by_hr.to(device), by_bvp.to(device)
+                optimizer.zero_grad()
+                logits, pred_hr, pred_bvp, _ = model(bx)
 
             # 1. Stress Classification Loss
             l_stress = criterion_stress(logits, by_stress)
@@ -359,13 +501,18 @@ def train_temporal_model(
         val_hr_errors = []
 
         with torch.no_grad():
-            for bx, by_stress, by_hr, by_bvp in val_loader:
-                bx = bx.to(device)
-                by_stress = by_stress.to(device)
-                by_hr = by_hr.to(device)
-                by_bvp = by_bvp.to(device)
+            for batch in val_loader:
+                if two_stream:
+                    bx_mic, bx_mac, by_stress, by_hr, by_bvp = batch
+                    bx_mic, bx_mac = bx_mic.to(device), bx_mac.to(device)
+                    by_stress, by_hr, by_bvp = by_stress.to(device), by_hr.to(device), by_bvp.to(device)
+                    logits, pred_hr, pred_bvp, _ = model(bx_mic, bx_mac)
+                else:
+                    bx, by_stress, by_hr, by_bvp = batch
+                    bx = bx.to(device)
+                    by_stress, by_hr, by_bvp = by_stress.to(device), by_hr.to(device), by_bvp.to(device)
+                    logits, pred_hr, pred_bvp, _ = model(bx)
 
-                logits, pred_hr, pred_bvp, _ = model(bx)
                 l_stress = criterion_stress(logits, by_stress)
                 l_hr = criterion_hr(pred_hr.squeeze(-1), by_hr)
                 l_bvp = 0.5 * criterion_bvp_mse(pred_bvp, by_bvp) + 0.5 * pearson_correlation_loss(pred_bvp, by_bvp)
@@ -398,20 +545,27 @@ def train_temporal_model(
 
         if is_best:
             best_val_score = f1
-            torch.save({
+            save_payload = {
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "val_acc": float(val_acc),
                 "val_f1": float(f1),
                 "val_hr_mae": float(val_hr_mae),
                 "window_size": window_size,
-                "input_dim": train_x.shape[-1],
+                "input_dim": 1280,
                 "hidden_dim": hidden_dim,
-                "multi_task": True
-            }, best_ckpt_path)
+                "multi_task": True,
+                "two_stream": bool(two_stream),
+            }
+            if two_stream:
+                save_payload["micro_window_size"] = window_size
+                save_payload["macro_window_size"] = macro_window_size
+                save_payload["macro_span_frames"] = macro_span_frames
+
+            torch.save(save_payload, best_ckpt_path)
 
     # 4. Final Evaluation on Held-Out Test Subjects (subjects 38-42)
-    print("\n--- Evaluating Best Multi-Task Temporal Model on Held-Out Test Subjects (38–42) ---")
+    print(f"\n--- Evaluating Best Temporal Model on Held-Out Test Subjects (38–42) ---")
     if os.path.exists(best_ckpt_path):
         ckpt = torch.load(best_ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
@@ -420,9 +574,16 @@ def train_temporal_model(
     test_preds, test_targets, test_probs = [], [], []
     test_pred_hrs, test_true_hrs = [], []
     with torch.no_grad():
-        for bx, by_stress, by_hr, by_bvp in test_loader:
-            bx = bx.to(device)
-            logits, pred_hr, pred_bvp, _ = model(bx)
+        for batch in test_loader:
+            if two_stream:
+                bx_mic, bx_mac, by_stress, by_hr, by_bvp = batch
+                bx_mic, bx_mac = bx_mic.to(device), bx_mac.to(device)
+                logits, pred_hr, pred_bvp, _ = model(bx_mic, bx_mac)
+            else:
+                bx, by_stress, by_hr, by_bvp = batch
+                bx = bx.to(device)
+                logits, pred_hr, pred_bvp, _ = model(bx)
+
             probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
             test_probs.extend(probs)
             test_preds.extend(torch.argmax(logits, dim=1).cpu().numpy())
@@ -440,7 +601,7 @@ def train_temporal_model(
 
     print(f"[Test Results] Accuracy: {test_acc:.2f}% | Precision: {t_prec*100:.2f}% | Recall: {t_rec*100:.2f}% | F1: {t_f1*100:.2f}% | HR MAE: {test_hr_mae:.2f} BPM | ROC-AUC: {t_auc:.2f}%")
 
-    # 5. Step 22: Temporal Moving Average Smoothing Demonstration
+    # 5. Temporal Moving Average Smoothing Demonstration
     smoother = TemporalMovingAverageSmoother(window_size=3)
     raw_probs = np.array(test_probs)
     smoothed_probs = smoother.smooth_sequence(raw_probs)
@@ -450,9 +611,12 @@ def train_temporal_model(
     jitter_reduction = ((raw_jitter - smooth_jitter) / (raw_jitter + 1e-6)) * 100.0
 
     # Save artifacts & summary
-    pd.DataFrame(history).to_csv(os.path.join(config.LOGS_DIR, "temporal_training_history.csv"), index=False)
+    hist_file = "temporal_training_history_twostream.csv" if two_stream else "temporal_training_history.csv"
+    pd.DataFrame(history).to_csv(os.path.join(config.LOGS_DIR, hist_file), index=False)
 
     summary = {
+        "architecture": arch_name,
+        "two_stream": bool(two_stream),
         "multi_task": True,
         "best_val_f1": float(best_val_score),
         "test_accuracy": float(test_acc),
@@ -465,17 +629,20 @@ def train_temporal_model(
         "smoothed_jitter": float(smooth_jitter),
         "jitter_reduction_percent": float(jitter_reduction),
         "window_size": int(window_size),
-        "train_windows": int(len(train_x)),
-        "val_windows": int(len(val_x)),
-        "test_windows": int(len(test_x)),
+        "macro_window_size": int(macro_window_size) if two_stream else None,
+        "macro_span_frames": int(macro_span_frames) if two_stream else None,
+        "train_windows": int(len(train_loader.dataset)),
+        "val_windows": int(len(val_loader.dataset)),
+        "test_windows": int(len(test_loader.dataset)),
     }
 
-    summary_path = os.path.join(TEMPORAL_RESULTS_DIR, "temporal_evaluation_summary.json")
+    summary_file = "temporal_evaluation_summary_twostream.json" if two_stream else "temporal_evaluation_summary.json"
+    summary_path = os.path.join(TEMPORAL_RESULTS_DIR, summary_file)
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
 
     print("=" * 65)
-    print(f"[SUCCESS] Multi-Task Temporal Stress Inference Training Complete!")
+    print(f"[SUCCESS] Temporal Stress Inference Training Complete ({arch_name})!")
     print(f"Checkpoint saved to: {best_ckpt_path}")
     print("=" * 65)
     return summary
@@ -493,7 +660,11 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for regularization")
     parser.add_argument("--lambda_hr", type=float, default=0.05, help="Multi-task loss weight for Heart Rate (BPM)")
     parser.add_argument("--lambda_bvp", type=float, default=0.10, help="Multi-task loss weight for BVP waveform")
-    parser.add_argument("--window_size", type=int, default=10, help="Window size (frames)")
+    parser.add_argument("--window_size", type=int, default=10, help="Window size (frames) for single-stream or micro stream")
+    parser.add_argument("--two_stream", action="store_true", help="Enable Multi-Scale Two-Stream (Micro + Macro) Temporal Architecture (Change 2)")
+    parser.add_argument("--macro_window_size", type=int, default=30, help="Number of frames sampled for Macro stream")
+    parser.add_argument("--macro_span_frames", type=int, default=60, help="Total historical frame span for Macro stream")
+    parser.add_argument("--ckpt_name", type=str, default=None, help="Custom checkpoint filename")
     parser.add_argument("--stride", type=int, default=2, help="Window stride for train")
     parser.add_argument("--baseline_seconds", type=float, default=30.0, help="Baseline duration in seconds")
     parser.add_argument("--fps", type=float, default=6.0, help="Sampling frame rate")
@@ -514,7 +685,11 @@ if __name__ == "__main__":
         lambda_hr=args.lambda_hr,
         lambda_bvp=args.lambda_bvp,
         window_size=args.window_size,
+        macro_window_size=args.macro_window_size,
+        macro_span_frames=args.macro_span_frames,
+        two_stream=args.two_stream,
         stride=args.stride,
         baseline_seconds=args.baseline_seconds,
         fps=args.fps,
+        ckpt_name=args.ckpt_name
     )

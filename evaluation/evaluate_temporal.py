@@ -23,8 +23,8 @@ from sklearn.metrics import confusion_matrix, classification_report, accuracy_sc
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
-from models.temporal_model import TemporalStressGRU
-from training.train_temporal import extract_or_load_features, load_phase2_feature_extractor
+from models.temporal_model import TemporalStressGRU, TwoStreamTemporalStressGRU
+from training.train_temporal import extract_or_load_features, extract_or_load_twostream_features, load_phase2_feature_extractor
 
 TEMPORAL_RESULTS_DIR = os.path.join(config.RESULTS_DIR, "temporal")
 
@@ -110,19 +110,16 @@ def run_temporal_evaluation(data_dir=None, ckpt_path=None, phase2_ckpt=None, thr
     os.makedirs(TEMPORAL_RESULTS_DIR, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load feature extractor and extract/load test features
-    encoder = load_phase2_feature_extractor(ckpt_path=phase2_ckpt, device=device)
-    test_feats, test_labels, test_hr, test_bvp, subjs = extract_or_load_features(
-        encoder, data_dir, "test", window_size=window_size, stride=stride, device=device
-    )
-
-    # Candidate checkpoints
+    # Candidate checkpoints (prioritizing two-stream if present or requested)
     candidate_ckpts = []
     if ckpt_path:
         candidate_ckpts.append(ckpt_path)
     candidate_ckpts.extend([
+        os.path.join(config.CHECKPOINTS_DIR, "best_temporal_stress_model_twostream.pth"),
         os.path.join(config.CHECKPOINTS_DIR, "best_temporal_stress_model.pth"),
+        "/kaggle/working/Stress-Detection/models_checkpoints/best_temporal_stress_model_twostream.pth",
         "/kaggle/working/Stress-Detection/models_checkpoints/best_temporal_stress_model.pth",
+        "/kaggle/working/models_checkpoints/best_temporal_stress_model_twostream.pth",
         "/kaggle/working/models_checkpoints/best_temporal_stress_model.pth",
     ])
 
@@ -138,30 +135,70 @@ def run_temporal_evaluation(data_dir=None, ckpt_path=None, phase2_ckpt=None, thr
     print(f"[Model Checkpoint] Loading: {final_ckpt}")
     ckpt = torch.load(final_ckpt, map_location=device, weights_only=False)
     state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
-    input_dim = ckpt.get("input_dim", test_feats.shape[-1])
-    
-    # Auto-detect hidden_dim from GRU weights
-    if "gru.weight_ih_l0" in state_dict:
-        hidden_dim = state_dict["gru.weight_ih_l0"].shape[0] // 3
+
+    # Determine whether model is Two-Stream (Change 2) or Single-Stream (Change 1)
+    is_two_stream = bool(ckpt.get("two_stream", False) or "gru_micro.weight_ih_l0" in state_dict)
+    encoder = load_phase2_feature_extractor(ckpt_path=phase2_ckpt, device=device)
+
+    if is_two_stream:
+        micro_w = ckpt.get("micro_window_size", window_size)
+        macro_w = ckpt.get("macro_window_size", 30)
+        macro_span = ckpt.get("macro_span_frames", 60)
+        arch_title = f"Multi-Scale Two-Stream BiGRU (Micro: {micro_w}f, Macro: {macro_w}f/{macro_span}f)"
+        print(f"[Architecture] Detected Two-Stream: Micro={micro_w} frames, Macro={macro_w} frames across {macro_span} span")
+
+        test_micro, test_macro, test_labels, test_hr, test_bvp, subjs = extract_or_load_twostream_features(
+            encoder, data_dir, "test", micro_window_size=micro_w, macro_window_size=macro_w,
+            macro_span_frames=macro_span, stride=stride, device=device
+        )
+        input_dim = ckpt.get("input_dim", test_micro.shape[-1])
+        if "gru_micro.weight_ih_l0" in state_dict:
+            hidden_dim = state_dict["gru_micro.weight_ih_l0"].shape[0] // 3
+        else:
+            hidden_dim = ckpt.get("hidden_dim", 64)
+
+        model = TwoStreamTemporalStressGRU(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            num_layers=2,
+            num_classes=2,
+            micro_window_size=micro_w,
+            macro_window_size=macro_w,
+            bidirectional=True
+        ).to(device)
     else:
-        hidden_dim = ckpt.get("hidden_dim", 64)
+        arch_title = f"Single-Stream BiGRU (Window: {window_size} frames)"
+        print(f"[Architecture] Detected Single-Stream (Window={window_size} frames)")
 
-    print(f"[Model Spec] Input Dim: {input_dim} | Hidden Dim: {hidden_dim} (BiGRU Multi-Task)")
-    model = TemporalStressGRU(
-        input_dim=input_dim,
-        hidden_dim=hidden_dim,
-        num_layers=2,
-        num_classes=2,
-        window_size=window_size,
-        bidirectional=True
-    ).to(device)
+        test_feats, test_labels, test_hr, test_bvp, subjs = extract_or_load_features(
+            encoder, data_dir, "test", window_size=window_size, stride=stride, device=device
+        )
+        input_dim = ckpt.get("input_dim", test_feats.shape[-1])
+        if "gru.weight_ih_l0" in state_dict:
+            hidden_dim = state_dict["gru.weight_ih_l0"].shape[0] // 3
+        else:
+            hidden_dim = ckpt.get("hidden_dim", 64)
 
+        model = TemporalStressGRU(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            num_layers=2,
+            num_classes=2,
+            window_size=window_size,
+            bidirectional=True
+        ).to(device)
+
+    print(f"[Model Spec] Architecture: {arch_title} | Input Dim: {input_dim} | Hidden Dim: {hidden_dim}")
     model.load_state_dict(state_dict, strict=False)
     model.eval()
 
     # 1. Evaluate Test Predictions
     with torch.no_grad():
-        out = model(test_feats.to(device))
+        if is_two_stream:
+            out = model(test_micro.to(device), test_macro.to(device))
+        else:
+            out = model(test_feats.to(device))
+
         if len(out) == 4:
             logits, pred_hr, pred_bvp, weights = out
             has_mt = True
@@ -215,22 +252,23 @@ def run_temporal_evaluation(data_dir=None, ckpt_path=None, phase2_ckpt=None, thr
     print(cm)
 
     # Save CSV
+    suffix = "_twostream" if is_two_stream else ""
     df_cm = pd.DataFrame(cm, index=[f"True_{c}" for c in class_names], columns=[f"Pred_{c}" for c in class_names])
-    csv_path = os.path.join(TEMPORAL_RESULTS_DIR, "confusion_matrix.csv")
+    csv_path = os.path.join(TEMPORAL_RESULTS_DIR, f"confusion_matrix{suffix}.csv")
     df_cm.to_csv(csv_path)
     print(f"[Saved CSV] {csv_path}")
 
     # Plot raw & normalized heatmaps
-    raw_plot = os.path.join(TEMPORAL_RESULTS_DIR, "confusion_matrix.png")
-    plot_temporal_confusion_matrix(cm, class_names, raw_plot, title=f"Temporal Stress Confusion Matrix (tau={selected_thresh:.2f})", normalize=False)
+    raw_plot = os.path.join(TEMPORAL_RESULTS_DIR, f"confusion_matrix{suffix}.png")
+    plot_temporal_confusion_matrix(cm, class_names, raw_plot, title=f"Stress Confusion Matrix (tau={selected_thresh:.2f}, {arch_title})", normalize=False)
 
-    norm_plot = os.path.join(TEMPORAL_RESULTS_DIR, "confusion_matrix_normalized.png")
-    plot_temporal_confusion_matrix(cm, class_names, norm_plot, title=f"Temporal Stress Confusion Matrix Normalized (tau={selected_thresh:.2f})", normalize=True)
+    norm_plot = os.path.join(TEMPORAL_RESULTS_DIR, f"confusion_matrix_normalized{suffix}.png")
+    plot_temporal_confusion_matrix(cm, class_names, norm_plot, title=f"Stress Confusion Matrix Normalized (tau={selected_thresh:.2f}, {arch_title})", normalize=True)
 
     # Classification report
     report = classification_report(targets, preds, target_names=class_names, output_dict=True)
     report_df = pd.DataFrame(report).transpose()
-    rep_csv = os.path.join(TEMPORAL_RESULTS_DIR, "classification_report.csv")
+    rep_csv = os.path.join(TEMPORAL_RESULTS_DIR, f"classification_report{suffix}.csv")
     report_df.to_csv(rep_csv)
     print(f"[Saved Report] {rep_csv}")
 
@@ -242,7 +280,7 @@ def run_temporal_evaluation(data_dir=None, ckpt_path=None, phase2_ckpt=None, thr
     except Exception:
         auc = 0.0
 
-    print(f"\nFinal Test Metrics on Unseen UBFC Subjects (38–42):")
+    print(f"\nFinal Test Metrics on Unseen UBFC Subjects (38–42) [{arch_title}]:")
     print(f"  - Accuracy   : {acc:.2f}% ({cm[0,0] + cm[1,1]}/{len(targets)} windows)")
     print(f"  - Specificity: {spec:.2f}% ({cm[0,0]}/{cm[0,0] + cm[0,1]} Calm windows correctly identified)")
     print(f"  - Sensitivity: {rec * 100:.2f}% ({cm[1,1]}/{cm[1,0] + cm[1,1]} Stress windows correctly identified)")
