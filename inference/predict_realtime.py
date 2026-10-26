@@ -59,6 +59,16 @@ class RealtimeTemporalStressPipeline:
         )
 
         phase2_ckpt = os.path.join(config.CHECKPOINTS_DIR, "best_rafdb_affective_model.pth")
+        if not os.path.exists(phase2_ckpt):
+            import glob
+            parts = sorted(glob.glob(f"{phase2_ckpt}.part*"))
+            if parts:
+                print(f"[Auto-Reassembly] Reassembling {len(parts)} chunks into {phase2_ckpt}...")
+                with open(phase2_ckpt, "wb") as out_f:
+                    for pt in parts:
+                        with open(pt, "rb") as in_f:
+                            out_f.write(in_f.read())
+                print(f"[Auto-Reassembly] Done! {phase2_ckpt} is ready.")
         if os.path.exists(phase2_ckpt):
             print(f"[Phase 2 Model] Loading: {phase2_ckpt}")
             ckpt = torch.load(phase2_ckpt, map_location=self.device, weights_only=False)

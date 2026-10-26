@@ -3,13 +3,18 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Data & Large checkpoints
+# Data & Large archives
 data/
 *.npz
-*.pth
 *.7z
 *.zip
 *.avi
+
+# Keep models_checkpoints tracked
+models_checkpoints/best_rafdb_affective_model.pth
+!models_checkpoints/*.part*
+!models_checkpoints/*.tflite
+!models_checkpoints/best_temporal_stress_model.pth
 
 # Environments
 .vscode/

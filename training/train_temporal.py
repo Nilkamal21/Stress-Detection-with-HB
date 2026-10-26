@@ -65,7 +65,17 @@ def load_phase2_feature_extractor(ckpt_path=None, device="cuda"):
     ])
 
     loaded = False
+    import glob
     for p in candidate_ckpts:
+        if not os.path.exists(p):
+            parts = sorted(glob.glob(f"{p}.part*"))
+            if parts:
+                print(f"[Auto-Reassembly] Reassembling {len(parts)} chunks into {p}...")
+                with open(p, "wb") as out_f:
+                    for pt in parts:
+                        with open(pt, "rb") as in_f:
+                            out_f.write(in_f.read())
+                print(f"[Auto-Reassembly] Done! {p} is ready.")
         if os.path.exists(p):
             print(f"[Phase 2 Model] Loading checkpoint: {p}")
             ckpt = torch.load(p, map_location=device, weights_only=False)
