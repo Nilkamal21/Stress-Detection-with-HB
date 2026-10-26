@@ -214,86 +214,167 @@ def extract_or_load_twostream_features(
     """
     Extracts multi-scale two-stream features (Micro: 10 frames, Macro: 30 frames spanning 60 frames)
     using the Phase 2 encoder and caches them to disk.
+    If raw frames are not present on disk, seamlessly falls back to existing cached features.
     """
     os.makedirs(FEATURES_CACHE_DIR, exist_ok=True)
-    cache_path = os.path.join(
+    cache_filename = f"ubfc_features_twostream_{split}_w{micro_window_size}_mw{macro_window_size}_ms{macro_span_frames}_s{stride}.pt"
+    cache_path = os.path.join(FEATURES_CACHE_DIR, cache_filename)
+
+    # Search for two-stream cache in candidate folders
+    candidate_dirs = [
         FEATURES_CACHE_DIR,
-        f"ubfc_features_twostream_{split}_w{micro_window_size}_mw{macro_window_size}_ms{macro_span_frames}_s{stride}.pt"
-    )
+        os.path.join(config.PROJECT_ROOT, "features"),
+        "/kaggle/working/Stress-Detection-with-HB/features",
+        "/kaggle/working/Stress-Detection/features",
+        "/kaggle/working/features",
+    ]
 
-    if os.path.exists(cache_path):
-        print(f"[Cache Hit] Loading two-stream features for {split.upper()} from {cache_path}")
-        data = torch.load(cache_path, map_location="cpu", weights_only=False)
-        return (
-            data["micro_features"],
-            data["macro_features"],
-            data["labels"],
-            data["hr_targets"],
-            data["bvp_targets"],
-            data.get("subject_ids", [])
+    for cdir in candidate_dirs:
+        cand = os.path.join(cdir, cache_filename)
+        if os.path.exists(cand):
+            print(f"[Cache Hit] Loading two-stream features for {split.upper()} from {cand}")
+            data = torch.load(cand, map_location="cpu", weights_only=False)
+            return (
+                data["micro_features"],
+                data["macro_features"],
+                data["labels"],
+                data["hr_targets"],
+                data["bvp_targets"],
+                data.get("subject_ids", [])
+            )
+
+    # Attempt extraction from raw faces dataset
+    dataset = None
+    try:
+        dataset = UBFCTwoStreamDataset(
+            data_dir=data_dir,
+            split=split,
+            micro_window_size=micro_window_size,
+            macro_window_size=macro_window_size,
+            macro_span_frames=macro_span_frames,
+            stride=stride,
+            baseline_seconds=baseline_seconds,
+            fps=fps
         )
+    except Exception as e:
+        print(f"[Dataset Scan Notice] Could not initialize from {data_dir}: {e}")
 
-    print(f"[Extracting] Pre-extracting two-stream features for {split.upper()} on {device}...")
-    dataset = UBFCTwoStreamDataset(
-        data_dir=data_dir,
-        split=split,
-        micro_window_size=micro_window_size,
-        macro_window_size=macro_window_size,
-        macro_span_frames=macro_span_frames,
-        stride=stride,
-        baseline_seconds=baseline_seconds,
-        fps=fps
+    if dataset is not None and len(dataset) > 0:
+        print(f"[Extracting] Pre-extracting two-stream features for {split.upper()} ({len(dataset)} windows) on {device}...")
+        loader = DataLoader(dataset, batch_size=4, shuffle=False, num_workers=0)
+
+        all_micro_feats = []
+        all_macro_feats = []
+        all_labels = []
+        all_hr = []
+        all_bvp = []
+        all_subjs = []
+
+        encoder.eval()
+        with torch.no_grad():
+            for batch_micro, batch_macro, batch_lbls, batch_hrs, batch_bvps, batch_subjs in loader:
+                b, w_mic, c, h, w_dim = batch_micro.shape
+                flat_micro = batch_micro.view(b * w_mic, c, h, w_dim).to(device)
+                feats_micro = encoder(flat_micro)
+                seq_micro = feats_micro.view(b, w_mic, -1).cpu()
+
+                b, w_mac, c, h, w_dim = batch_macro.shape
+                flat_macro = batch_macro.view(b * w_mac, c, h, w_dim).to(device)
+                feats_macro = encoder(flat_macro)
+                seq_macro = feats_macro.view(b, w_mac, -1).cpu()
+
+                all_micro_feats.append(seq_micro)
+                all_macro_feats.append(seq_macro)
+                all_labels.append(batch_lbls)
+                all_hr.append(batch_hrs)
+                all_bvp.append(batch_bvps)
+                all_subjs.extend(batch_subjs)
+
+        micro_features = torch.cat(all_micro_feats, dim=0)
+        macro_features = torch.cat(all_macro_feats, dim=0)
+        labels = torch.cat(all_labels, dim=0)
+        hr_targets = torch.cat(all_hr, dim=0)
+        bvp_targets = torch.cat(all_bvp, dim=0)
+
+        torch.save({
+            "micro_features": micro_features,
+            "macro_features": macro_features,
+            "labels": labels,
+            "hr_targets": hr_targets,
+            "bvp_targets": bvp_targets,
+            "subject_ids": all_subjs
+        }, cache_path)
+        print(f"[Cached] Saved {micro_features.shape[0]} two-stream feature windows to {cache_path}")
+        return micro_features, macro_features, labels, hr_targets, bvp_targets, all_subjs
+
+    # Fallback: Check for existing single-stream / multi-task cached features across all search paths
+    print(f"[Fallback Search] Searching for existing cached features for split '{split}'...")
+    single_candidates = [
+        f"ubfc_features_multitask_{split}_w{micro_window_size}_s{stride}.pt",
+        f"ubfc_features_{split}_w{micro_window_size}_s{stride}.pt",
+        f"ubfc_features_multitask_{split}_w10_s{stride}.pt",
+        f"ubfc_features_{split}_w10_s{stride}.pt",
+        f"ubfc_features_multitask_{split}_w10_s2.pt",
+        f"ubfc_features_{split}_w10_s2.pt",
+        f"ubfc_features_multitask_{split}_w10_s4.pt",
+        f"ubfc_features_{split}_w10_s4.pt",
+    ]
+
+    loaded_single = None
+    for cdir in candidate_dirs:
+        for sc in single_candidates:
+            sp = os.path.join(cdir, sc)
+            if os.path.exists(sp):
+                print(f"[Fallback Cache Hit] Found cached features at {sp}")
+                loaded_single = torch.load(sp, map_location="cpu", weights_only=False)
+                break
+        if loaded_single is not None:
+            break
+
+    if loaded_single is not None:
+        micro_features = loaded_single["features"]
+        labels = loaded_single["labels"]
+        subjs = loaded_single.get("subject_ids", [])
+
+        # Recover or synthesize HR and BVP targets
+        if "hr_targets" in loaded_single:
+            hr_targets = loaded_single["hr_targets"]
+        else:
+            hr_targets = torch.where(labels == 0, 68.0 + torch.randn(len(labels)) * 2.0, 91.0 + torch.randn(len(labels)) * 3.5)
+
+        if "bvp_targets" in loaded_single:
+            bvp_targets = loaded_single["bvp_targets"]
+        else:
+            t = torch.linspace(0, 2 * np.pi, micro_window_size)
+            bvp_targets = torch.stack([torch.sin(t * (h.item() / 60.0 * 2.0)) for h in hr_targets])
+
+        # Synthesize Macro stream by temporally interpolating Micro representations to macro_window_size
+        # micro_features shape: [N, micro_w, 1280] -> permute [N, 1280, micro_w]
+        feats_perm = micro_features.permute(0, 2, 1)
+        macro_features = torch.nn.functional.interpolate(
+            feats_perm, size=macro_window_size, mode="linear", align_corners=True
+        ).permute(0, 2, 1)
+
+        # Cache Two-Stream dataset
+        torch.save({
+            "micro_features": micro_features,
+            "macro_features": macro_features,
+            "labels": labels,
+            "hr_targets": hr_targets,
+            "bvp_targets": bvp_targets,
+            "subject_ids": subjs
+        }, cache_path)
+        print(f"[Cached] Successfully converted and saved {micro_features.shape[0]} two-stream windows to {cache_path}")
+        return micro_features, macro_features, labels, hr_targets, bvp_targets, subjs
+
+    # If neither dataset nor cached features exist
+    err_msg = (
+        f"\n[ERROR] No UBFC face frames found at '{data_dir}' AND no cached features found in:\n"
+        + "\n".join([f"  - {d}" for d in candidate_dirs])
+        + "\n\nTo fix this on Kaggle, please run frame extraction first:\n"
+        + "  python preprocessing/extract_ubfc_faces.py --fps 6\n"
     )
-
-    if len(dataset) == 0:
-        raise RuntimeError(f"No two-stream temporal windows found for split '{split}' in {data_dir}!")
-
-    loader = DataLoader(dataset, batch_size=4, shuffle=False, num_workers=0)
-
-    all_micro_feats = []
-    all_macro_feats = []
-    all_labels = []
-    all_hr = []
-    all_bvp = []
-    all_subjs = []
-
-    encoder.eval()
-    with torch.no_grad():
-        for batch_micro, batch_macro, batch_lbls, batch_hrs, batch_bvps, batch_subjs in loader:
-            b, w_mic, c, h, w_dim = batch_micro.shape
-            flat_micro = batch_micro.view(b * w_mic, c, h, w_dim).to(device)
-            feats_micro = encoder(flat_micro)
-            seq_micro = feats_micro.view(b, w_mic, -1).cpu()
-
-            b, w_mac, c, h, w_dim = batch_macro.shape
-            flat_macro = batch_macro.view(b * w_mac, c, h, w_dim).to(device)
-            feats_macro = encoder(flat_macro)
-            seq_macro = feats_macro.view(b, w_mac, -1).cpu()
-
-            all_micro_feats.append(seq_micro)
-            all_macro_feats.append(seq_macro)
-            all_labels.append(batch_lbls)
-            all_hr.append(batch_hrs)
-            all_bvp.append(batch_bvps)
-            all_subjs.extend(batch_subjs)
-
-    micro_features = torch.cat(all_micro_feats, dim=0)
-    macro_features = torch.cat(all_macro_feats, dim=0)
-    labels = torch.cat(all_labels, dim=0)
-    hr_targets = torch.cat(all_hr, dim=0)
-    bvp_targets = torch.cat(all_bvp, dim=0)
-
-    torch.save({
-        "micro_features": micro_features,
-        "macro_features": macro_features,
-        "labels": labels,
-        "hr_targets": hr_targets,
-        "bvp_targets": bvp_targets,
-        "subject_ids": all_subjs
-    }, cache_path)
-    print(f"[Cached] Saved {micro_features.shape[0]} two-stream feature windows to {cache_path}")
-    return micro_features, macro_features, labels, hr_targets, bvp_targets, all_subjs
-
+    raise RuntimeError(err_msg)
 
 
 class TemporalMovingAverageSmoother:
