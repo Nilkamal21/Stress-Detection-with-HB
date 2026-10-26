@@ -1,15 +1,22 @@
 {
-  "test_accuracy": 54.72,
-  "test_precision": 56.87,
-  "test_recall": 83.33,
-  "test_f1": 67.61,
-  "test_roc_auc": 57.74,
-  "raw_jitter": 0.0364,
-  "smoothed_jitter": 0.0238,
-  "jitter_reduction_percent": 34.62,
-  "window_size": 10,
-  "smoothing_k": 3,
-  "train_windows": 4784,
-  "val_windows": 508,
-  "test_windows": 508
+  "multi_task": true,
+  "operating_threshold_tau": 0.6,
+  "test_accuracy": 60.43,
+  "test_precision": 61.18,
+  "test_recall_sensitivity": 82.64,
+  "test_specificity": 31.36,
+  "test_f1_percent": 70.31,
+  "test_roc_auc_percent": 57.43,
+  "heart_rate_mae_bpm": 6.46,
+  "heart_rate_rmse_bpm": 9.76,
+  "heart_rate_pearson_r": 0.6168,
+  "window_size_frames": 10,
+  "test_windows": 508,
+  "held_out_test_subjects": [
+    "subject38",
+    "subject39",
+    "subject40",
+    "subject41",
+    "subject42"
+  ]
 }
